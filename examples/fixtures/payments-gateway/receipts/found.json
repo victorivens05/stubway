@@ -1,0 +1,10 @@
+{
+  "method": "GET",
+  "status": 200,
+  "description": "receipt found",
+  "body": {
+    "id": "rc_000123",
+    "amount": 4200,
+    "status": "captured"
+  }
+}

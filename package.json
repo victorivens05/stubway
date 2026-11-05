@@ -1,0 +1,53 @@
+{
+  "name": "stubway",
+  "version": "0.1.0",
+  "description": "File-seeded, in-memory, agent-navigable fake for external HTTP dependencies. Deterministic upstream mocking for Playwright and integration tests.",
+  "author": "Victor Ivens Pereira",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/victorivens05/stubway.git"
+  },
+  "homepage": "https://github.com/victorivens05/stubway#readme",
+  "bugs": {
+    "url": "https://github.com/victorivens05/stubway/issues"
+  },
+  "type": "module",
+  "bin": {
+    "stubway": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "SKILL.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "test": "node --import tsx --test test/**/*.test.ts",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "mock",
+    "stub",
+    "fixtures",
+    "http",
+    "testing",
+    "playwright",
+    "e2e",
+    "api"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@clack/prompts": "^0.7.0",
+    "commander": "^12.1.0",
+    "picocolors": "^1.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}

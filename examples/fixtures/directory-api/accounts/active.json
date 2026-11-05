@@ -1,0 +1,9 @@
+{
+  "method": "GET",
+  "status": 200,
+  "description": "account in good standing",
+  "body": {
+    "id": "acct_1",
+    "status": "active"
+  }
+}

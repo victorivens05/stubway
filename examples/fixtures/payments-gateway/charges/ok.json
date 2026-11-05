@@ -1,0 +1,10 @@
+{
+  "method": "POST",
+  "status": 201,
+  "description": "happy path — charge captured",
+  "body": {
+    "id": "ch_000123",
+    "status": "captured",
+    "amount": 4200
+  }
+}

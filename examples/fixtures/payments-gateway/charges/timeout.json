@@ -1,0 +1,9 @@
+{
+  "method": "POST",
+  "status": 504,
+  "description": "gateway hangs 30s then times out",
+  "timeoutMs": 30000,
+  "body": {
+    "error": "UPSTREAM_TIMEOUT"
+  }
+}

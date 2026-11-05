@@ -1,0 +1,9 @@
+{
+  "method": "POST",
+  "status": 422,
+  "description": "card rejected by the gateway",
+  "body": {
+    "error": "INVALID_CARD",
+    "message": "card number failed the Luhn check"
+  }
+}
