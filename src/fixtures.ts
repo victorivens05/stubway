@@ -2,10 +2,12 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
 import { CONFIG_FILE } from "./constants.js";
-import type { Fixture, FixtureMethod, Route } from "./types.js";
+import { errorMessage, evaluateFixtureScript } from "./handler.js";
+import type { Fixture, FixtureMethod, InvalidFixture, Route } from "./types.js";
 import { HTTP_METHODS } from "./types.js";
 
 const IGNORED_FILES = new Set([CONFIG_FILE]);
+const FIXTURE_EXTENSIONS = [".json", ".js"];
 
 /** Skip node_modules and any dot-directory (.git, .stubway/.local, …). */
 function isIgnoredDir(name: string): boolean {
@@ -14,27 +16,30 @@ function isIgnoredDir(name: string): boolean {
 
 /** Read the fixtures directory into a catalog of routes (filesystem-as-routing). */
 export function loadCatalog(fixturesDir: string): Route[] {
-  const byDir = new Map<string, Fixture[]>();
+  const byDir = new Map<string, Route>();
 
-  for (const file of listJsonFiles(fixturesDir)) {
-    const fixture = parseFixture(file);
-    if (!fixture) continue;
+  for (const file of listFixtureFiles(fixturesDir)) {
     const dir = path.dirname(file);
-    const bucket = byDir.get(dir);
-    if (bucket) bucket.push(fixture);
-    else byDir.set(dir, [fixture]);
+    let route = byDir.get(dir);
+    if (!route) {
+      route = { dir, path: toRoutePath(fixturesDir, dir), fixtures: [], invalidFixtures: [] };
+      byDir.set(dir, route);
+    }
+    const parsed = parseFixture(file);
+    const taken = [...route.fixtures, ...route.invalidFixtures].find((f) => f.name === parsed.name);
+    if (taken) {
+      const reason = `${path.basename(taken.file)} already defines fixture "${parsed.name}"`;
+      warn(`skipping ${rel(file)}: ${reason}`);
+      route.invalidFixtures.push({ name: parsed.name, file, reason });
+    } else if ("reason" in parsed) route.invalidFixtures.push(parsed);
+    else route.fixtures.push(parsed);
   }
 
-  return [...byDir.entries()]
-    .map(([dir, fixtures]) => ({
-      dir,
-      path: toRoutePath(fixturesDir, dir),
-      fixtures: fixtures.sort((a, b) => a.name.localeCompare(b.name)),
-    }))
-    .sort((a, b) => a.path.localeCompare(b.path));
+  for (const route of byDir.values()) route.fixtures.sort((a, b) => a.name.localeCompare(b.name));
+  return [...byDir.values()].sort((a, b) => a.path.localeCompare(b.path));
 }
 
-function listJsonFiles(root: string): string[] {
+function listFixtureFiles(root: string): string[] {
   const out: string[] = [];
   const walk = (dir: string) => {
     let entries;
@@ -47,58 +52,90 @@ function listJsonFiles(root: string): string[] {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         if (!isIgnoredDir(entry.name)) walk(full);
-      } else if (entry.isFile() && entry.name.endsWith(".json") && !IGNORED_FILES.has(entry.name)) {
+      } else if (entry.isFile() && isFixtureFile(entry.name)) {
         out.push(full);
       }
     }
   };
   walk(root);
-  return out;
+  return out.sort();
 }
 
-function parseFixture(file: string): Fixture | null {
+function isFixtureFile(name: string): boolean {
+  return FIXTURE_EXTENSIONS.includes(path.extname(name)) && !IGNORED_FILES.has(name);
+}
+
+function parseFixture(file: string): Fixture | InvalidFixture {
+  const isScript = path.extname(file) === ".js";
+  const name = path.basename(file, path.extname(file));
+  const invalid = (reason: string): InvalidFixture => {
+    warn(`skipping ${rel(file)}: ${reason}`);
+    return { name, file, reason };
+  };
+
   let data: unknown;
   try {
-    data = JSON.parse(readFileSync(file, "utf8"));
+    const source = readFileSync(file, "utf8");
+    data = isScript ? evaluateFixtureScript(source, file) : JSON.parse(source);
   } catch (err) {
-    warn(`skipping ${rel(file)}: invalid JSON (${(err as Error).message})`);
-    return null;
+    return invalid(`${isScript ? "evaluating it threw" : "invalid JSON"} (${errorMessage(err)})`);
   }
-
-  if (typeof data !== "object" || data === null) {
-    warn(`skipping ${rel(file)}: fixture must be a JSON object`);
-    return null;
+  if (typeof data !== "object" || data === null || Array.isArray(data)) {
+    return invalid(`fixture must be ${isScript ? "an object literal" : "a JSON object"}`);
   }
 
   const record = data as Record<string, unknown>;
-  if (typeof record.status !== "number") {
-    warn(`skipping ${rel(file)}: missing numeric "status"`);
-    return null;
-  }
+  const problem = envelopeProblem(record);
+  if (problem) return invalid(problem);
 
   return {
-    name: path.basename(file, ".json"),
+    name,
     file,
-    method: normalizeMethod(record.method),
-    status: record.status,
+    method: record.method === undefined ? "ANY" : ((record.method as string).toUpperCase() as FixtureMethod),
+    status: record.status as number,
     description: typeof record.description === "string" ? record.description : undefined,
-    headers: isStringRecord(record.headers) ? record.headers : undefined,
+    headers: record.headers as Record<string, string> | undefined,
     body: record.body,
-    timeoutMs: typeof record.timeoutMs === "number" ? record.timeoutMs : undefined,
+    timeoutMs: record.timeoutMs as number | undefined,
+    respond: record.respond as Fixture["respond"],
   };
 }
 
-function normalizeMethod(value: unknown): FixtureMethod {
-  if (typeof value !== "string") return "ANY";
+/** The first rule a fixture envelope breaks, or null. Shared by loading from disk and scaffolding. */
+export function envelopeProblem(envelope: Record<string, unknown>): string | null {
+  const { method, status, timeoutMs, headers, respond, body } = envelope;
+  if (method !== undefined && !isFixtureMethod(method)) {
+    return `"method" must be ANY or one of ${HTTP_METHODS.join(", ")}, got ${JSON.stringify(method)}`;
+  }
+  if (typeof status !== "number" || !Number.isInteger(status) || status < 200 || status > 599) {
+    return `"status" must be an integer from 200 to 599, got ${JSON.stringify(status)}`;
+  }
+  if (timeoutMs !== undefined && (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs < 0)) {
+    return `"timeoutMs" must be a non-negative number, got ${JSON.stringify(timeoutMs)}`;
+  }
+  if (headers !== undefined && !isStringRecord(headers)) {
+    return `"headers" must be an object of string values`;
+  }
+  if (respond !== undefined && typeof respond !== "function") {
+    return `"respond" must be a function of the request, in a .js fixture`;
+  }
+  if (respond !== undefined && body !== undefined) {
+    return `give "body" or "respond", not both`;
+  }
+  return null;
+}
+
+function isFixtureMethod(value: unknown): boolean {
+  if (typeof value !== "string") return false;
   const upper = value.toUpperCase();
-  if (upper === "ANY") return "ANY";
-  return (HTTP_METHODS as readonly string[]).includes(upper) ? (upper as FixtureMethod) : "ANY";
+  return upper === "ANY" || (HTTP_METHODS as readonly string[]).includes(upper);
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {
   return (
     typeof value === "object" &&
     value !== null &&
+    !Array.isArray(value) &&
     Object.values(value).every((v) => typeof v === "string")
   );
 }

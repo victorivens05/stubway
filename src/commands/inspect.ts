@@ -1,3 +1,4 @@
+import type { LogQuery } from "../client.js";
 import { formatLog, formatLogEntryDetail, formatRoute, formatRouteList, printJson } from "../format.js";
 import { makeClient, run } from "./context.js";
 
@@ -22,9 +23,19 @@ export function showCommand(routePath: string, opts: JsonOpt): Promise<void> {
   });
 }
 
-export function logCommand(opts: JsonOpt & { route?: string; since?: string }): Promise<void> {
+export function logCommand(
+  opts: JsonOpt & { route?: string; method?: string; since?: string; limit?: string; bodies?: boolean },
+): Promise<void> {
   return run(async () => {
-    const { entries } = await makeClient(opts).log({ route: opts.route, since: opts.since });
+    if (opts.bodies && !opts.json) throw new Error("--bodies only works with --json");
+    const query: LogQuery = {
+      route: opts.route,
+      method: opts.method,
+      since: opts.since,
+      limit: opts.limit === undefined ? undefined : Number(opts.limit),
+    };
+    if (opts.json && opts.bodies) return printJson((await makeClient(opts).logWithBodies(query)).entries);
+    const { entries } = await makeClient(opts).log(query);
     if (opts.json) return printJson(entries);
     process.stdout.write(formatLog(entries) + "\n");
   });

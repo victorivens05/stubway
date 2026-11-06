@@ -1,6 +1,6 @@
 {
   "name": "stubway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "File-seeded, in-memory, agent-navigable fake for external HTTP dependencies. Deterministic upstream mocking for Playwright and integration tests.",
   "author": "Victor Ivens Pereira",
   "repository": {

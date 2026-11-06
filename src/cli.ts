@@ -17,7 +17,7 @@ program
   .command("start")
   .description("Start the mock daemon (detached by default; returns once ready).")
   .option("-p, --port <port>", "port to listen on")
-  .option("-f, --fixtures <dir>", "fixtures directory (default: ./fixtures)")
+  .option("-f, --fixtures <dir>", "fixtures directory (default: ./.stubway)")
   .option("--proxy <baseUrl>", "forward unmatched requests to this upstream")
   .option("--record", "when proxying, save upstream responses as new fixtures")
   .option("--persist", "on exit, write config.json + requests/ to the project root")
@@ -27,6 +27,7 @@ program
 program
   .command("stop")
   .description("Stop the running daemon in this directory.")
+  .option("-p, --port <port>", "only stop it if it listens on this port (or STUBWAY_PORT)")
   .option("--json", "output JSON")
   .action(stopCommand);
 
@@ -52,7 +53,7 @@ program
 
 program
   .command("use <route> <fixture>")
-  .description("Set the active fixture for a route.")
+  .description("Set the active fixture for a route; a comma-separated list (a,b) serves them in order, then stays on the last.")
   .option("-p, --port <port>", "daemon port")
   .option("--json", "output JSON")
   .action(useCommand);
@@ -62,7 +63,10 @@ const log = program
   .description("Show the captured request log.")
   .option("-p, --port <port>", "daemon port")
   .option("--route <route>", "filter by route path")
-  .option("--since <iso>", "only entries at/after this ISO timestamp")
+  .option("--method <method>", "filter by HTTP method")
+  .option("--since <time>", "only entries at/after this ISO timestamp or epoch milliseconds")
+  .option("--limit <n>", "only the most recent n entries")
+  .option("--bodies", "with --json, include each entry's headers and bodies")
   .option("--json", "output JSON")
   .action(logCommand);
 
@@ -86,7 +90,8 @@ const scaffold = program
 scaffold
   .command("fixture <route> <name>")
   .description("Create a fixture file (writes to disk; no running daemon required).")
-  .option("-f, --fixtures <dir>", "fixtures directory (defaults to the running daemon's, else ./fixtures)")
+  .option("-f, --fixtures <dir>", "fixtures directory (defaults to the running daemon's, else ./.stubway)")
+  .option("-p, --port <port>", "write into the fixtures directory of the daemon on this port")
   .option("-m, --method <method>", "HTTP method (default: ANY)")
   .option("-s, --status <status>", "status code (default: 201 for POST, else 200)")
   .option("-d, --description <text>", "human-readable description")

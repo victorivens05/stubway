@@ -16,10 +16,11 @@ export type HttpMethod = (typeof HTTP_METHODS)[number];
 export type FixtureMethod = HttpMethod | "ANY";
 
 /**
- * A single response definition, stored as one JSON file on disk.
+ * A single response definition, stored as one file on disk: a JSON envelope, or a `.js`
+ * handler fixture whose envelope may carry `respond(req)` in place of `body`.
  *
  *   { "method": "POST", "status": 201, "description": "...", "body": { ... } }
- *   { "status": 500, "timeoutMs": 3000, "description": "upstream hangs then errors" }
+ *   { status: 201, respond: (req) => ({ body: { valor: req.body.valor } }) }
  */
 export interface Fixture {
   /** File name without extension, e.g. "ok", "boom", "invalid-card". */
@@ -36,6 +37,26 @@ export interface Fixture {
   body?: unknown;
   /** Delay before responding, in milliseconds. Models slow upstreams / timeouts. */
   timeoutMs?: number;
+  /** Handler fixtures only. Its status and headers override the envelope's; it alone gives the body. */
+  respond?: (req: HandlerRequest) => unknown;
+}
+
+/** What a handler fixture's `respond` receives. */
+export interface HandlerRequest {
+  method: string;
+  path: string;
+  params: Record<string, string>;
+  query: Record<string, string>;
+  headers: Record<string, string>;
+  /** Parsed JSON when the body was JSON, the raw string otherwise, undefined when empty. */
+  body: unknown;
+}
+
+/** A fixture file that failed to load, kept so a selection naming it can say why. */
+export interface InvalidFixture {
+  name: string;
+  file: string;
+  reason: string;
 }
 
 /** A route is a directory that directly contains one or more fixture files. */
@@ -45,12 +66,28 @@ export interface Route {
   /** Absolute directory on disk. */
   dir: string;
   fixtures: Fixture[];
+  invalidFixtures: InvalidFixture[];
 }
 
-/** Active fixture per route, per method: selections[routePath][method] = fixtureName. */
-export type Selections = Record<string, Partial<Record<FixtureMethod, string>>>;
+/** Fixtures served in order, one per request; `cursor` stays on the last one once reached. */
+export interface FixtureSequence {
+  names: string[];
+  cursor: number;
+}
 
-/** One captured request/response pair. */
+export type Selection = string | FixtureSequence;
+
+/** Active fixture per route, per method: selections[routePath][method] = name or sequence. */
+export type Selections = Record<string, Partial<Record<FixtureMethod, Selection>>>;
+
+/**
+ * pending: received, response not sent yet (e.g. waiting out a fixture's timeoutMs).
+ * aborted: the client closed the connection before the response was sent.
+ * failed: stubway itself threw while answering.
+ */
+export type LogState = "pending" | "done" | "aborted" | "failed";
+
+/** One captured request/response pair, logged on receipt and completed when answered. */
 export interface LogEntry {
   id: string;
   timestamp: string;
@@ -68,6 +105,9 @@ export interface LogEntry {
   unmatched: boolean;
   proxied: boolean;
   durationMs: number;
+  state: LogState;
+  /** Why stubway answered with its own error: a broken selection, a handler failure, a crash. */
+  error: string | null;
 }
 
 /** Effective runtime configuration for a running daemon. */

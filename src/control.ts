@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { LogEntryDto, RouteDto } from "./client.js";
 import { CONTROL_PREFIX } from "./constants.js";
 import { readBody, sendJson } from "./http.js";
 import { StateError, type StubwayState } from "./state.js";
@@ -6,22 +7,25 @@ import type { LogEntry, Route } from "./types.js";
 import { version } from "./version.js";
 
 /** DTO for a route as exposed by the control API. */
-export function routeDto(state: StubwayState, route: Route) {
+export function routeDto(state: StubwayState, route: Route): RouteDto {
   return {
     path: route.path,
     active: state.activeByMethod(route),
+    sequences: state.sequencesByMethod(route),
+    problems: state.problemsFor(route),
     fixtures: route.fixtures.map((f) => ({
       name: f.name,
       method: f.method,
       status: f.status,
       description: f.description,
       timeoutMs: f.timeoutMs,
+      handler: f.respond !== undefined,
     })),
   };
 }
 
 /** Lean summary for the log list — omits request/response bodies to keep listings cheap. */
-export function logSummaryDto(entry: LogEntry) {
+export function logSummaryDto(entry: LogEntry): LogEntryDto {
   return {
     id: entry.id,
     timestamp: entry.timestamp,
@@ -34,6 +38,8 @@ export function logSummaryDto(entry: LogEntry) {
     unmatched: entry.unmatched,
     proxied: entry.proxied,
     durationMs: entry.durationMs,
+    state: entry.state,
+    error: entry.error,
   };
 }
 
@@ -55,6 +61,7 @@ export async function handleControl(
       return sendJson(res, 200, {
         ok: true,
         version,
+        pid: process.pid,
         port: state.runtime.port,
         fixturesDir: state.runtime.fixturesDir,
         proxy: state.runtime.proxy,
@@ -81,8 +88,8 @@ export async function handleControl(
     if (method === "POST" && route === "/use") {
       const { value } = await readBody(req);
       const { route: routePath, fixture } = asObject(value);
-      if (typeof routePath !== "string" || typeof fixture !== "string") {
-        return sendJson(res, 400, { error: 'body must be { "route": string, "fixture": string }' });
+      if (typeof routePath !== "string" || !isFixtureNames(fixture)) {
+        return sendJson(res, 400, { error: 'body must be { "route": string, "fixture": string | string[] }' });
       }
       const updated = state.setSelection(routePath, fixture);
       return sendJson(res, 200, routeDto(state, updated));
@@ -91,9 +98,15 @@ export async function handleControl(
     if (method === "GET" && route === "/log") {
       const entries = state.queryLog({
         route: url.searchParams.get("route") ?? undefined,
+        method: url.searchParams.get("method") ?? undefined,
         since: url.searchParams.get("since") ?? undefined,
+        limit: parseLimit(url.searchParams.get("limit")),
       });
-      return sendJson(res, 200, { count: entries.length, entries: entries.map(logSummaryDto) });
+      const withBodies = url.searchParams.get("bodies") === "1";
+      return sendJson(res, 200, {
+        count: entries.length,
+        entries: withBodies ? entries : entries.map(logSummaryDto),
+      });
     }
 
     if (method === "GET" && route.startsWith("/log/") && route !== "/log/clear") {
@@ -112,6 +125,20 @@ export async function handleControl(
     const status = err instanceof StateError ? 400 : 500;
     return sendJson(res, status, { error: (err as Error).message });
   }
+}
+
+function parseLimit(raw: string | null): number | undefined {
+  if (raw === null) return undefined;
+  const limit = Number(raw);
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new StateError(`limit must be a positive integer, got "${raw}"`);
+  }
+  return limit;
+}
+
+function isFixtureNames(value: unknown): value is string | string[] {
+  if (typeof value === "string") return true;
+  return Array.isArray(value) && value.length > 0 && value.every((name) => typeof name === "string");
 }
 
 function asObject(value: unknown): Record<string, unknown> {

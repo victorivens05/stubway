@@ -4,18 +4,20 @@ import pc from "picocolors";
 import { ControlClient, type RouteDto } from "../client.js";
 import { daemonStatus, startDetached, stopDaemon, type DaemonInfo } from "../daemon.js";
 import { formatLog } from "../format.js";
+import { findProjectDir } from "../paths.js";
 import { createFixture, type NewFixtureInput } from "../scaffold.js";
 import { HTTP_METHODS, type FixtureMethod } from "../types.js";
-import { resolveRuntime } from "./start.js";
+import { loadCatalog } from "../fixtures.js";
+import { fixturesRootProblems, resolveRuntime } from "./start.js";
 
 export async function menuCommand(opts: { port?: string }): Promise<void> {
   const cwd = process.cwd();
   p.intro(pc.bgGreen(pc.black(" stubway ")));
 
   for (;;) {
-    const status = await daemonStatus(cwd);
+    const status = await daemonStatus(findProjectDir(cwd));
     const done = status.running && status.info
-      ? await runningMenu(new ControlClient(status.info.port), status.info)
+      ? await runningMenu(new ControlClient(status.info.port, status.info.pid), status.info)
       : await stoppedMenu(cwd, opts);
     if (done === "exit") break;
   }
@@ -48,8 +50,12 @@ async function stoppedMenu(cwd: string, opts: { port?: string }): Promise<MenuRe
   const spinner = p.spinner();
   spinner.start("Starting daemon");
   try {
-    const info = await startDetached(resolveRuntime({ port: String(port), fixtures: String(fixtures) }, cwd));
+    const runtime = resolveRuntime({ port: String(port), fixtures: String(fixtures) }, cwd);
+    const info = await startDetached(runtime);
     spinner.stop(`Daemon running (pid ${info.pid}) on port ${info.port}`);
+    for (const problem of fixturesRootProblems(runtime.fixturesDir, loadCatalog(runtime.fixturesDir))) {
+      p.log.warn(problem);
+    }
   } catch (err) {
     spinner.stop(pc.red((err as Error).message));
   }
@@ -74,7 +80,7 @@ async function runningMenu(client: ControlClient, info: DaemonInfo): Promise<Men
     else if (action === "log") await viewLog(client);
     else if (action === "newFixture") await newFixture(info.fixturesDir);
     else if (action === "stop") {
-      await stopDaemon(process.cwd());
+      await stopDaemon(findProjectDir(process.cwd()));
       p.log.success("Daemon stopped.");
       return "continue";
     }
@@ -98,6 +104,10 @@ async function browse(client: ControlClient): Promise<void> {
   if (p.isCancel(routePath)) return;
 
   const route = routes.find((r) => r.path === routePath)!;
+  if (route.fixtures.length === 0) {
+    p.log.warn(`${routePath} has no valid fixture.\n${route.problems.join("\n")}`);
+    return;
+  }
   const fixture = await p.select({
     message: `Set active fixture for ${routePath}`,
     options: route.fixtures.map((f) => ({

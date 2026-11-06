@@ -11,11 +11,13 @@ interface JsonOpt {
   json?: boolean;
 }
 
+/** `fixture` is one name, or a comma-separated list that becomes a sequence. */
 export function useCommand(route: string, fixture: string, opts: JsonOpt): Promise<void> {
   return run(async () => {
-    const updated = await makeClient(opts).use(route, fixture);
+    const names = fixture.split(",").map((name) => name.trim()).filter(Boolean);
+    const updated = await makeClient(opts).use(route, names.length === 1 ? names[0]! : names);
     if (opts.json) return printJson(updated);
-    process.stdout.write(`${pc.green("✓")} ${route} → ${pc.green(fixture)}\n${formatRoute(updated)}\n`);
+    process.stdout.write(`${pc.green("✓")} ${route} → ${pc.green(names.join(" → "))}\n${formatRoute(updated)}\n`);
   });
 }
 

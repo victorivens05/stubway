@@ -14,6 +14,13 @@ export function writeFixture(
   writeFileSync(path.join(dir, `${name}.json`), JSON.stringify(content));
 }
 
+/** Write one `.js` handler fixture under fixturesDir with the given source. */
+export function writeHandler(fixturesDir: string, routePath: string, name: string, source: string): void {
+  const dir = path.join(fixturesDir, ...routePath.split("/").filter(Boolean));
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, `${name}.js`), source);
+}
+
 /** A fresh temp directory to use as a fixtures root; caller should remove it after the test. */
 export function makeTempFixturesDir(): string {
   return mkdtempSync(path.join(tmpdir(), "stubway-test-"));

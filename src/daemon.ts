@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONTROL_PREFIX, DAEMON_LOG, PIDFILE } from "./constants.js";
@@ -59,24 +59,33 @@ function isAlive(pid: number): boolean {
   }
 }
 
-export async function isHealthy(port: number): Promise<boolean> {
+const HEALTH_TIMEOUT_MS = 3000;
+
+export interface DaemonHealth {
+  pid?: number;
+  version?: string;
+  fixturesDir?: string;
+}
+
+/** The health payload of whatever stubway answers on `port`, or null. */
+export async function fetchHealth(port: number): Promise<DaemonHealth | null> {
   try {
-    const res = await fetch(`http://127.0.0.1:${port}${CONTROL_PREFIX}/health`);
-    return res.ok;
+    const res = await fetch(`http://127.0.0.1:${port}${CONTROL_PREFIX}/health`, {
+      signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+    });
+    return res.ok ? ((await res.json()) as DaemonHealth) : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
-/** Resolve the daemon's status from the pidfile, pruning stale entries. */
+/** Resolve the daemon's status from the pidfile, pruning it unless its process answers health as itself. */
 export async function daemonStatus(cwd: string): Promise<DaemonStatus> {
   const info = readDaemonInfo(cwd);
   if (!info) return { running: false, info: null };
-  if (!isAlive(info.pid) || !(await isHealthy(info.port))) {
-    removeDaemonInfo(cwd);
-    return { running: false, info: null };
-  }
-  return { running: true, info };
+  if (isAlive(info.pid) && (await fetchHealth(info.port))?.pid === info.pid) return { running: true, info };
+  removeDaemonInfo(cwd);
+  return { running: false, info: null };
 }
 
 const CLI_ENTRY = path.join(path.dirname(fileURLToPath(import.meta.url)), "cli.js");
@@ -95,6 +104,7 @@ export async function startDetached(runtime: RuntimeConfig): Promise<DaemonInfo>
   const logFd = openSync(daemonLogPath(runtime.cwd), "a");
 
   const args = [CLI_ENTRY, "start", "--foreground", "--port", String(runtime.port), "--fixtures", runtime.fixturesDir];
+  const logStart = existsSync(daemonLogPath(runtime.cwd)) ? statSync(daemonLogPath(runtime.cwd)).size : 0;
   if (runtime.proxy) args.push("--proxy", runtime.proxy);
   if (runtime.record) args.push("--record");
   if (runtime.persist) args.push("--persist");
@@ -107,22 +117,36 @@ export async function startDetached(runtime: RuntimeConfig): Promise<DaemonInfo>
   child.unref();
 
   for (let attempt = 0; attempt < 100; attempt++) {
-    if (await isHealthy(runtime.port)) {
+    if (child.pid !== undefined && (await fetchHealth(runtime.port))?.pid === child.pid) {
       const info = readDaemonInfo(runtime.cwd);
       if (info) return info;
     }
     if (child.exitCode !== null) {
-      throw new Error(`daemon exited during startup — see ${path.relative(runtime.cwd, daemonLogPath(runtime.cwd))}`);
+      throw new Error(`daemon exited during startup:\n${startupOutput(runtime.cwd, logStart)}`);
     }
     await delay(100);
   }
   throw new Error(`daemon did not become healthy on port ${runtime.port} within 10s`);
 }
 
-/** Stop a running daemon. Returns the info of the daemon that was stopped, or null. */
-export async function stopDaemon(cwd: string): Promise<DaemonInfo | null> {
+/** What the child wrote to the daemon log during this start, trimmed to its last lines. */
+function startupOutput(cwd: string, from: number): string {
+  try {
+    const lines = readFileSync(daemonLogPath(cwd)).subarray(from).toString("utf8").trim().split("\n");
+    return lines.slice(-8).map((line) => `  ${line}`).join("\n");
+  } catch {
+    return `  (see ${path.relative(cwd, daemonLogPath(cwd))})`;
+  }
+}
+
+/**
+ * Stop a running daemon, only if it listens on `port` when one is given.
+ * Returns the info of the daemon that was stopped, or null.
+ */
+export async function stopDaemon(cwd: string, port?: number): Promise<DaemonInfo | null> {
   const status = await daemonStatus(cwd);
   if (!status.running || !status.info) return null;
+  if (port !== undefined && status.info.port !== port) return null;
 
   try {
     process.kill(status.info.pid, "SIGTERM");

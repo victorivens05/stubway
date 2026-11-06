@@ -1,13 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { canonicalizeRoutePath, loadCatalog } from "./fixtures.js";
+import path from "node:path";
+import { canonicalizeRoutePath, loadCatalog, toRouteDir } from "./fixtures.js";
 import type {
   Fixture,
   FixtureMethod,
+  FixtureSequence,
   LogEntry,
   Route,
   RuntimeConfig,
   Selections,
 } from "./types.js";
+
+/** The largest timestamp a JavaScript Date can hold. */
+const MAX_DATE_MS = 8.64e15;
 
 /** Preference order when no explicit selection exists for a method. */
 const DEFAULT_FIXTURE_NAMES = ["default", "ok", "success"];
@@ -25,9 +30,22 @@ export class StubwayState {
     this.runtime = runtime;
   }
 
-  /** Re-read fixtures from disk (selections are preserved; stale ones simply fall back). */
+  /**
+   * Re-read fixtures from disk. A route someone selected a fixture on stays in the catalog even
+   * after its last file is gone, so its requests report the broken selection instead of falling
+   * through to a dynamic sibling route or the proxy.
+   */
   reload(): void {
-    this.catalog = loadCatalog(this.runtime.fixturesDir);
+    const catalog = loadCatalog(this.runtime.fixturesDir);
+    const vanished = Object.keys(this.selections)
+      .filter((routePath) => !catalog.some((route) => route.path === routePath))
+      .map((routePath) => ({
+        path: routePath,
+        dir: toRouteDir(this.runtime.fixturesDir, routePath),
+        fixtures: [],
+        invalidFixtures: [],
+      }));
+    this.catalog = [...catalog, ...vanished].sort((a, b) => a.path.localeCompare(b.path));
   }
 
   /**
@@ -60,50 +78,84 @@ export class StubwayState {
     return [...new Set(route.fixtures.map((f) => f.method))];
   }
 
-  /** Resolve which fixture answers a request for the given method. */
-  resolveFixture(route: Route, method: FixtureMethod): Fixture | undefined {
-    const candidates = route.fixtures.filter(
-      (f) => f.method === method || (method !== "ANY" && f.method === "ANY"),
-    );
-    if (candidates.length === 0) return undefined;
-
-    const routeSelections = this.selections[route.path];
-    const selectedName =
-      routeSelections?.[method] ?? (method !== "ANY" ? routeSelections?.ANY : undefined);
-    if (selectedName) {
-      const chosen = candidates.find((f) => f.name === selectedName);
-      if (chosen) return chosen;
-    }
-
-    for (const preferred of DEFAULT_FIXTURE_NAMES) {
-      const match = candidates.find((f) => f.name === preferred);
-      if (match) return match;
-    }
-    return candidates[0];
+  /**
+   * Resolve which fixture answers a request for the given method. Never advances a sequence;
+   * the server does that with advanceSequence once the step answered.
+   */
+  resolveFixture(route: Route, method: FixtureMethod): FixtureResolution {
+    const selected = this.selectedFixture(route, method);
+    if (selected) return selected;
+    const fixture = defaultFixture(route, method);
+    return fixture ? { kind: "served", fixture } : { kind: "noFixture" };
   }
 
-  /** The set of fixture names currently active (across every method of a route). */
+  /** The fixture name currently active per method of a route, broken selections included. */
   activeByMethod(route: Route): Record<string, string> {
     const result: Record<string, string> = {};
     for (const method of this.methodsFor(route)) {
-      const fixture = this.resolveFixture(route, method);
-      if (fixture) result[method] = fixture.name;
+      const resolution = this.resolveFixture(route, method);
+      if (resolution.kind !== "noFixture") result[method] = resolutionName(resolution);
     }
     return result;
   }
 
-  /** Set the active fixture for a route. The fixture's own method decides the slot. */
-  setSelection(routePath: string, fixtureName: string): Route {
+  /** Invalid fixture files and selections that can't be served, as readable lines. */
+  problemsFor(route: Route): string[] {
+    const problems = route.invalidFixtures.map((f) => `${path.basename(f.file)} is invalid: ${f.reason}`);
+    for (const method of Object.keys(this.selections[route.path] ?? {}) as FixtureMethod[]) {
+      const resolution = this.selectedFixture(route, method);
+      if (resolution?.kind === "brokenSelection") problems.push(`${method} selection: ${resolution.reason}`);
+    }
+    return problems;
+  }
+
+  /** Sequences set on a route, keyed by the method slot that holds them. */
+  sequencesByMethod(route: Route): Record<string, FixtureSequence> {
+    const result: Record<string, FixtureSequence> = {};
+    for (const [method, selection] of Object.entries(this.selections[route.path] ?? {})) {
+      if (selection && typeof selection !== "string") {
+        result[method] = { names: [...selection.names], cursor: selection.cursor };
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Set the active fixture for a route, or a sequence served one per request. The fixtures'
+   * own method decides the slot, so every name in a sequence must share one. Resets the cursor.
+   */
+  setSelection(routePath: string, fixtureNames: string | string[]): Route {
     const route = this.getRoute(routePath);
     if (!route) throw new StateError(`unknown route: ${routePath}`);
-    const fixture = route.fixtures.find((f) => f.name === fixtureName);
-    if (!fixture) {
-      const available = route.fixtures.map((f) => f.name).join(", ") || "(none)";
-      throw new StateError(`unknown fixture "${fixtureName}" for ${routePath}. available: ${available}`);
+    const names = typeof fixtureNames === "string" ? [fixtureNames] : fixtureNames;
+    if (names.length === 0) throw new StateError(`no fixture name given for ${routePath}`);
+
+    const fixtures = names.map((name) => findFixture(route, routePath, name));
+    const methods = new Set(fixtures.map((f) => f.method));
+    if (methods.size > 1) {
+      const listed = fixtures.map((f) => `${f.name} (${f.method})`).join(", ");
+      throw new StateError(`a sequence must use fixtures of one method, got: ${listed}`);
     }
+
     const slot = (this.selections[route.path] ??= {});
-    slot[fixture.method] = fixture.name;
+    slot[fixtures[0]!.method] = names.length === 1 ? names[0]! : { names: [...names], cursor: 0 };
     return route;
+  }
+
+  private selectedFixture(
+    route: Route,
+    method: FixtureMethod,
+  ): FixtureResolution | undefined {
+    const routeSelections = this.selections[route.path];
+    const selection = routeSelections?.[method] ?? (method !== "ANY" ? routeSelections?.ANY : undefined);
+    if (selection === undefined) return undefined;
+    const name = typeof selection === "string" ? selection : selection.names[selection.cursor]!;
+    const fixture = candidatesFor(route, method).find((f) => f.name === name);
+    if (fixture) {
+      const sequence = typeof selection === "string" ? undefined : selection;
+      return { kind: "served", fixture, sequence };
+    }
+    return { kind: "brokenSelection", name, reason: brokenSelectionReason(route, name) };
   }
 
   record(entry: Omit<LogEntry, "id" | "timestamp">): LogEntry {
@@ -112,18 +164,22 @@ export class StubwayState {
     return full;
   }
 
-  queryLog(opts: { route?: string; since?: string } = {}): LogEntry[] {
+  /** Filter the log; `limit` keeps the most recent entries. Throws StateError on an unreadable `since`. */
+  queryLog(opts: LogFilter = {}): LogEntry[] {
     let entries = this.log;
     if (opts.route) {
       const wanted = normalizePath(canonicalizeRoutePath(opts.route));
       entries = entries.filter((e) => e.matchedRoute === wanted || e.path === wanted);
     }
-    if (opts.since) {
-      const cutoff = Date.parse(opts.since);
-      if (!Number.isNaN(cutoff)) {
-        entries = entries.filter((e) => Date.parse(e.timestamp) >= cutoff);
-      }
+    if (opts.method) {
+      const wanted = opts.method.toUpperCase();
+      entries = entries.filter((e) => e.method === wanted);
     }
+    if (opts.since) {
+      const cutoff = parseSince(opts.since);
+      entries = entries.filter((e) => Date.parse(e.timestamp) >= cutoff);
+    }
+    if (opts.limit !== undefined) entries = entries.slice(-opts.limit);
     return entries;
   }
 
@@ -140,6 +196,91 @@ export class StubwayState {
 }
 
 export class StateError extends Error {}
+
+/** Saved selections prepared for a daemon that is starting: every sequence is back at its first fixture. */
+export function restoreSelections(selections: Selections): Selections {
+  return Object.fromEntries(
+    Object.entries(selections).map(([routePath, byMethod]) => [routePath, rewindSequences(byMethod)]),
+  );
+}
+
+function rewindSequences(byMethod: Selections[string]): Selections[string] {
+  return Object.fromEntries(
+    Object.entries(byMethod).map(([method, selection]) => [
+      method,
+      typeof selection === "string" ? selection : { names: [...selection.names], cursor: 0 },
+    ]),
+  );
+}
+
+/**
+ * served: this fixture answers; `sequence` is set when a sequence chose it.
+ * brokenSelection: a fixture was chosen with `use` but can't be served (deleted, invalid, method changed).
+ * noFixture: nothing on the route answers this method.
+ */
+export type FixtureResolution =
+  | { kind: "served"; fixture: Fixture; sequence?: FixtureSequence }
+  | { kind: "brokenSelection"; name: string; reason: string }
+  | { kind: "noFixture" };
+
+export interface LogFilter {
+  route?: string;
+  method?: string;
+  /** ISO timestamp or epoch milliseconds. */
+  since?: string;
+  limit?: number;
+}
+
+function candidatesFor(route: Route, method: FixtureMethod): Fixture[] {
+  return route.fixtures.filter((f) => f.method === method || (method !== "ANY" && f.method === "ANY"));
+}
+
+/** With nothing selected: the method's own fixtures first, ANY fixtures only as a fallback. */
+function defaultFixture(route: Route, method: FixtureMethod): Fixture | undefined {
+  const exact = route.fixtures.filter((f) => f.method === method);
+  const fallback = method === "ANY" ? [] : route.fixtures.filter((f) => f.method === "ANY");
+  return preferredFixture(exact) ?? preferredFixture(fallback);
+}
+
+function preferredFixture(fixtures: Fixture[]): Fixture | undefined {
+  for (const preferred of DEFAULT_FIXTURE_NAMES) {
+    const match = fixtures.find((f) => f.name === preferred);
+    if (match) return match;
+  }
+  return fixtures[0];
+}
+
+function resolutionName(resolution: Exclude<FixtureResolution, { kind: "noFixture" }>): string {
+  return resolution.kind === "served" ? resolution.fixture.name : resolution.name;
+}
+
+function brokenSelectionReason(route: Route, name: string): string {
+  const invalid = route.invalidFixtures.find((f) => f.name === name);
+  if (invalid) return `selected fixture "${name}" is invalid: ${invalid.reason}`;
+  const otherMethod = route.fixtures.find((f) => f.name === name);
+  if (otherMethod) return `selected fixture "${name}" now declares method ${otherMethod.method}`;
+  return `selected fixture "${name}" no longer exists in ${route.dir}`;
+}
+
+function parseSince(since: string): number {
+  const cutoff = /^\d+$/.test(since) ? Number(since) : Date.parse(since);
+  if (!Number.isFinite(cutoff) || Math.abs(cutoff) > MAX_DATE_MS) {
+    throw new StateError(`unreadable since "${since}": use an ISO timestamp or epoch milliseconds`);
+  }
+  return cutoff;
+}
+
+/** Move a sequence to its next fixture, staying on the last one. */
+export function advanceSequence(sequence: FixtureSequence): void {
+  sequence.cursor = Math.min(sequence.cursor + 1, sequence.names.length - 1);
+}
+
+function findFixture(route: Route, routePath: string, name: string): Fixture {
+  const fixture = route.fixtures.find((f) => f.name === name);
+  if (fixture) return fixture;
+  const available = route.fixtures.map((f) => f.name).join(", ") || "(none)";
+  throw new StateError(`unknown fixture "${name}" for ${routePath}. available: ${available}`);
+}
 
 /** A route that matched a concrete request, with any captured dynamic segments. */
 export interface RouteMatch {
